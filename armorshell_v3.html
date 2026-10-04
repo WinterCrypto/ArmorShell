@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<!-- ArmorShell v2 — per-app storage compartments (delete wipes app data; reset & legacy cleanup) + rename fixes the displayed name. -->
-<meta name="version" content="armorshell_v2">
+<!-- ArmorShell v3.1 — the version shows under the name. v3: app files now live in IndexedDB (much more room than localStorage's ~5 MB). v2: per-app storage compartments (delete wipes app data; reset & legacy cleanup) + rename fixes the displayed name. -->
+<meta name="version" content="armorshell_v3.1">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -49,6 +49,9 @@
   .brand .mk{width:26px;height:26px;flex:none;}
   .brand .mk svg{width:100%;height:100%;display:block;}
   .brand h1{font-size:18.5px;font-weight:700;letter-spacing:-0.02em;}
+.brand .bwrap{display:flex;flex-direction:column;line-height:1.1;}
+.ver{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.04em;margin-top:2px;font-variant-numeric:tabular-nums;}
+.herover{margin:-4px 0 10px;}
   .top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px;}
   .add{display:inline-flex;align-items:center;gap:6px;padding:8px 13px;border-radius:11px;background:var(--accent-soft);border:1px solid var(--accent-line);color:var(--accent-hi);font-size:13px;font-weight:650;font-family:inherit;white-space:nowrap;transition:background .15s,transform .15s;}
   .add:active{transform:scale(.97);background:var(--accent-line);}
@@ -240,14 +243,84 @@
     };
   })();
 
+  /* ===== Big storage (v3) =====
+     App files and the library list live in IndexedDB, the browser's database. It has far more room than
+     localStorage, which Safari caps at about 5 MB per site. Each app's own saved data stays in its localStorage
+     compartment (below), which now has that space to itself. Files saved by v2 are moved over once, on start:
+     each one is copied, read back and checked before its old copy is removed. Without IndexedDB, v2 storage is used. */
+  var db=null;
+  function idbOpen(){
+    return new Promise(function(res){
+      try{
+        if(!window.indexedDB){ res(null); return; }
+        var rq=indexedDB.open("armorshell",1);
+        rq.onupgradeneeded=function(){ var d=rq.result; if(!d.objectStoreNames.contains("files")) d.createObjectStore("files"); if(!d.objectStoreNames.contains("meta")) d.createObjectStore("meta"); };
+        rq.onsuccess=function(){ res(rq.result); };
+        rq.onerror=function(){ res(null); };
+        rq.onblocked=function(){ res(null); };
+      }catch(e){ res(null); }
+    });
+  }
+  function idbReq(name, mode, fn){
+    return new Promise(function(res,rej){
+      try{
+        var tx=db.transaction(name,mode), r=fn(tx.objectStore(name)), out;
+        if(r) r.onsuccess=function(){ out=r.result; };
+        tx.oncomplete=function(){ res(out); };
+        tx.onerror=tx.onabort=function(){ rej(tx.error||new Error("Storage error")); };
+      }catch(e){ rej(e); }
+    });
+  }
+  function idbGet(name,k){ return idbReq(name,"readonly",function(s){ return s.get(k); }); }
+  function idbPut(name,k,v){ return idbReq(name,"readwrite",function(s){ return s.put(v,k); }); }
+  function idbDel(name,k){ return idbReq(name,"readwrite",function(s){ return s.delete(k); }); }
+
+  /* ===== Version (shown under the name) ===== */
+  var APP_VERSION="3.1";
+
   /* ===== Model ===== */
-  var index = store.get("lv.index", []);            // [{id,name,kind,size,added,opened}]
-  if(!Array.isArray(index)) index=[];
+  var index = [];                                     // [{id,name,kind,size,added,opened,icon,title}]
 
   function uid(){ return "f"+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
-  function saveIndex(){ try{ store.set("lv.index", index); }catch(e){} }
+  function saveIndex(){
+    if(db){ idbPut("meta","index",index).catch(function(){}); return; }
+    try{ store.set("lv.index", index); }catch(e){}
+  }
   function contentKey(id){ return "lv.f."+id; }
-  function getContent(id){ return store.raw(contentKey(id)) || ""; }
+  /* A file is read from IndexedDB; a file not moved yet is still read from localStorage. */
+  function getContent(id){
+    var old=function(){ return store.raw(contentKey(id)) || ""; };
+    if(!db) return Promise.resolve(old());
+    return idbGet("files",id).then(function(v){ return (typeof v==="string") ? v : old(); }, old);
+  }
+  function putContent(id, text){
+    if(!db){ store.setRaw(contentKey(id), text); return Promise.resolve(); }   // may throw (quota)
+    return idbPut("files", id, text).then(function(){ store.remove(contentKey(id)); });
+  }
+  function removeContent(id){
+    store.remove(contentKey(id));
+    return db ? idbDel("files", id).catch(function(){}) : Promise.resolve();
+  }
+  /* Move v2 data (localStorage) into IndexedDB. Returns how many files were moved. */
+  async function migrate(){
+    var lsIndex=store.get("lv.index", null), idbIndex;
+    try{ idbIndex=await idbGet("meta","index"); }catch(e){ idbIndex=undefined; }
+    index = Array.isArray(idbIndex) ? idbIndex : (Array.isArray(lsIndex) ? lsIndex : []);
+    var moved=0;
+    for(var i=0;i<index.length;i++){
+      var id=index[i].id, k=contentKey(id), v=store.raw(k);
+      if(v==null) continue;
+      try{
+        var have=await idbGet("files", id);
+        if(have!==v){ await idbPut("files", id, v); have=await idbGet("files", id); }
+        if(have===v){ store.remove(k); moved++; }
+      }catch(e){ /* this file stays in localStorage and is still read from there */ }
+    }
+    if(!Array.isArray(idbIndex) && Array.isArray(lsIndex)){
+      try{ await idbPut("meta","index",index); var chk=await idbGet("meta","index"); if(Array.isArray(chk) && chk.length===index.length) store.remove("lv.index"); }catch(e){}
+    } else if(Array.isArray(idbIndex) && lsIndex!=null){ store.remove("lv.index"); }
+    return moved;
+  }
 
   /* ===== Per-app storage compartments =====
      Each app runs with localStorage/indexedDB transparently prefixed to lv.app.<id>.*
@@ -440,12 +513,12 @@
       rd.readAsText(file);
     });
   }
-  function upsert(rec){
+  async function upsert(rec){
     var nm=rec.name, existing=null;
     for(var i=0;i<index.length;i++){ if(index[i].name===nm){ existing=index[i]; break; } }
     var id=existing?existing.id:uid();
     try{
-      store.setRaw(contentKey(id), rec.content);
+      await putContent(id, rec.content);
       var size=rec.content.length;
       if(existing){ existing.size=size; existing.kind=rec.kind; existing.opened=Date.now(); existing.icon=rec.icon||null; if(!existing.custom){ existing.title=rec.title||null; } }
       else { index.unshift({ id:id, name:nm, kind:rec.kind, size:size, added:Date.now(), opened:Date.now(), icon:rec.icon||null, title:rec.title||null }); }
@@ -462,11 +535,11 @@
     for(var i=0;i<files.length;i++){
       try{
         var rec = isZipFile(files[i]) ? await readZipApp(files[i]) : await readTextFile(files[i]);
-        var id=upsert(rec);
+        var id=await upsert(rec);
         if(id){ added.push(id); } else { failed++; err="Storage is full \u2014 remove an app and try again."; }
       }catch(e){ failed++; err=(e&&e.message)||err; }
     }
-    gridAnim=true; saveIndex(); renderLibrary();
+    gridAnim=true; saveIndex(); renderLibrary(); updateFree();
     if(added.length===1){ openItem(added[0]); }
     else if(added.length>1){ toast(added.length+" apps added."); }
     if(failed && !added.length){ toast(err||"Couldn\u2019t add that file."); }
@@ -489,7 +562,7 @@
     var MARK='<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#5fb1cb"/><g fill="none" stroke="#102026" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 11l-4 5 4 5"/><path d="M19 11l4 5-4 5"/><path d="M17.5 9.5l-3 13"/></g></svg>';
     var help=''+
       '<details class="help"><summary>How this works<span class="chev">\u203a</span></summary><div class="body"><ol>'+
-        '<li><b>Import</b> an <b>.html</b> file or a PWA <b>.zip</b> once. It\u2019s stored on this device only.</li>'+
+        '<li><b>Import</b> an <b>.html</b> file or a PWA <b>.zip</b> once. It\u2019s stored on this device only, in the browser\u2019s database, which has room for many large apps.</li>'+
         '<li>Tap an app to <b>open</b> it \u2014 it runs live and uses its own icon. <b>Press &amp; hold, then drag</b> to rearrange; tap \u22ef for options. Zips are unpacked automatically.</li>'+
         '<li>Each app\u2019s saved data lives in its <b>own compartment</b> on this device. <b>Delete</b> removes the app <i>and</i> its data; re-importing a file with the <b>same name updates</b> the app and keeps its data. \u22ef \u2192 <b>Reset app data</b> wipes data but keeps the app.</li>'+
         '<li>Add ArmorShell to your Home Screen (Share \u2192 Add to Home Screen) to launch it like an app.</li>'+
@@ -501,20 +574,34 @@
     if(index.length){
       var grid='<div class="grid'+(gridAnim?' anim':'')+'" id="appGrid">'+tilesHTML()+'</div>';
       el.innerHTML=''+
-        '<header class="top"><div class="brand"><span class="mk">'+MARK+'</span><h1>ArmorShell</h1></div>'+
+        '<header class="top"><div class="brand"><span class="mk">'+MARK+'</span><span class="bwrap"><h1>ArmorShell</h1><span class="ver" id="appVer">v'+APP_VERSION+'</span></span></div>'+
           '<button class="add" data-import><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Import</button></header>'+
-        '<div class="lbl">Library<span class="use">'+index.length+' '+(index.length===1?"item":"items")+' \u00b7 '+fmtSize(totalBytes())+'</span></div>'+
+        '<div class="lbl">Library<span class="use">'+index.length+' '+(index.length===1?"item":"items")+' \u00b7 '+fmtSize(totalBytes())+'<span id="freeSpace">'+freeText+'</span></span></div>'+
         grid+help+legacy+privacy;
     } else {
       el.innerHTML=''+
         '<div class="hero">'+
           '<div class="mark">'+MARK+'</div>'+
-          '<div class="heroname">ArmorShell</div>'+
+          '<div class="heroname">ArmorShell</div><div class="ver herover" id="appVer">v'+APP_VERSION+'</div>'+
           '<p>Your private app shelf. Import an HTML file or a PWA <b>.zip</b> and it runs right here with its own icon \u2014 saved only on this device.</p>'+
           '<div class="dropzone" id="dropzone"><button class="import-btn" data-import><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Import a file</button></div>'+
         '</div>'+help+legacy+privacy;
     }
     gridAnim=false;
+  }
+
+  /* How much room is left, from the browser. Shown after the library size. */
+  var freeText="";
+  function updateFree(){
+    try{
+      if(!(navigator.storage && navigator.storage.estimate)) return;
+      navigator.storage.estimate().then(function(e){
+        if(!e || !e.quota) return;
+        var left=Math.max(0, e.quota-(e.usage||0));
+        freeText=' \u00b7 '+(left>=1073741824 ? (left/1073741824).toFixed(left>=10737418240?0:1)+' GB' : fmtSize(left))+' free';
+        var el=document.getElementById("freeSpace"); if(el) el.textContent=freeText;
+      }, function(){});
+    }catch(e){}
   }
 
   /* ===== Open / run ===== */
@@ -532,7 +619,9 @@
     currentId=it.id;
     document.getElementById("runTitle").textContent=displayName(it);
     showView("runner");
-    mountFrame(getContent(it.id));
+    var stage=document.getElementById("stage"); stage.innerHTML='<div class="stage-load"><div class="spin"></div></div>';
+    var id=it.id;
+    getContent(id).then(function(html){ if(currentId===id && document.getElementById("runner").classList.contains("active")) mountFrame(html); });
   }
   function mountFrame(html){
     var stage=document.getElementById("stage");
@@ -550,7 +639,7 @@
     f.srcdoc = (currentId!=null) ? injectSandbox(html, currentId) : html;
     setTimeout(hide, 5000);
   }
-  function reloadFrame(){ if(currentId!=null) mountFrame(getContent(currentId)); }
+  function reloadFrame(){ if(currentId!=null){ var id=currentId; getContent(id).then(function(html){ if(currentId===id) mountFrame(html); }); } }
   function unmountFrame(){ var stage=document.getElementById("stage"); if(stage) stage.innerHTML=""; }
 
   var wrapOn=false;
@@ -558,7 +647,8 @@
     currentId=it.id;
     document.getElementById("codeTitle").textContent=displayName(it);
     var pre=document.getElementById("codePre");
-    pre.textContent=getContent(it.id);
+    pre.textContent="";
+    getContent(it.id).then(function(t){ if(currentId===it.id) pre.textContent=t; });
     pre.classList.toggle("wrap", wrapOn);
     document.querySelector(".codewrap").scrollTop=0;
     // show "run" button only for html
@@ -586,9 +676,9 @@
     var it=findItem(id); if(!it) return;
     if(!confirm('Delete "'+it.name+'" and the data it saved on this device? (The original file on your computer/phone is not affected.)')) return;
     clearAppData(id);
-    store.remove(contentKey(id));
+    removeContent(id);
     index=index.filter(function(x){ return x.id!==id; });
-    saveIndex(); renderLibrary();
+    saveIndex(); renderLibrary(); setTimeout(updateFree, 300);
     toast("Deleted, data cleared.");
   }
   function resetItemData(id){
@@ -795,7 +885,15 @@
   window.addEventListener("popstate", function(){ if(!document.getElementById("library").classList.contains("active")){ showView("library"); renderLibrary(); } });
 
   /* ===== Init ===== */
-  renderLibrary();
+  (async function init(){
+    db=await idbOpen();
+    var moved=0;
+    if(db){ try{ moved=await migrate(); }catch(e){ index=store.get("lv.index", index); } }
+    else { index=store.get("lv.index", []); }
+    if(!Array.isArray(index)) index=[];
+    renderLibrary(); updateFree();
+    if(moved) setTimeout(function(){ toast("Storage upgraded. Your apps now have much more room."); }, 400);
+  })();
 })();
 </script>
 </body>
